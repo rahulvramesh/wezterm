@@ -12,11 +12,11 @@ use crate::overlay::selector::{matcher_pattern, matcher_score};
 use crate::termwindow::TermWindowNotif;
 use config::configuration;
 use config::keyassignment::{KeyAssignment, SpawnCommand, SpawnTabDomain};
+use mux::Mux;
 use mux::domain::{DomainId, DomainState};
 use mux::pane::PaneId;
 use mux::termwiztermtab::TermWizTerminal;
 use mux::window::WindowId;
-use mux::Mux;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use termwiz::cell::{AttributeChange, CellAttributes};
@@ -136,11 +136,14 @@ impl LauncherArgs {
             for dom in domains.into_iter() {
                 let name = dom.domain_name();
                 let label = dom.domain_label().await;
-                let label = if name == label || label == "" {
+                let mut label = if name == label || label == "" {
                     format!("domain `{}`", name)
                 } else {
                     format!("domain `{}` - {}", name, label)
                 };
+                if let Some(forward_summary) = ssh_local_forward_summary(name) {
+                    label.push_str(&format!(" ({forward_summary})"));
+                }
                 d.push(LauncherDomainEntry {
                     domain_id: dom.domain_id(),
                     name: name.to_string(),
@@ -166,6 +169,30 @@ impl LauncherArgs {
             fuzzy_help_text: fuzzy_help_text.to_string(),
             alphabet: alphabet.to_string(),
         }
+    }
+}
+
+fn ssh_local_forward_summary(domain_name: &str) -> Option<String> {
+    let config = configuration();
+    let ssh_domain = config
+        .ssh_domains
+        .iter()
+        .find(|dom| dom.name == domain_name)?;
+
+    let forwards = ssh_domain
+        .ssh_option
+        .get("localforward")
+        .or_else(|| ssh_domain.ssh_option.get("LocalForward"))?
+        .split_whitespace()
+        .count()
+        / 2;
+
+    if forwards == 0 {
+        None
+    } else if forwards == 1 {
+        Some("1 port forward".to_string())
+    } else {
+        Some(format!("{forwards} port forwards"))
     }
 }
 
