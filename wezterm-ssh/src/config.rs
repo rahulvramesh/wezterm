@@ -346,11 +346,14 @@ impl ParsedConfigFile {
                 fn add_option(options: &mut ConfigMap, k: String, v: &str) {
                     // first option wins in ssh_config, except for identityfile
                     // which explicitly allows multiple entries to combine together
-                    let is_identity_file = k == "identityfile";
+                    let combines = matches!(
+                        k.as_str(),
+                        "identityfile" | "localforward" | "remoteforward"
+                    );
                     options
                         .entry(k)
                         .and_modify(|e| {
-                            if is_identity_file {
+                            if combines {
                                 e.push(' ');
                                 e.push_str(v);
                             }
@@ -1142,6 +1145,40 @@ Config {
     "identityfile": "/home/me/.ssh/id_pub.dsa /home/me/.ssh/id_pub.rsa",
     "port": "22",
     "user": "foo",
+    "userknownhostsfile": "/home/me/.ssh/known_hosts /home/me/.ssh/known_hosts2",
+}
+"#
+        );
+    }
+
+    #[test]
+    fn multiple_localforward() {
+        let mut config = Config::new();
+
+        let mut fake_env = ConfigMap::new();
+        fake_env.insert("HOME".to_string(), "/home/me".to_string());
+        fake_env.insert("USER".to_string(), "me".to_string());
+        config.assign_environment(fake_env);
+
+        config.add_config_string(
+            r#"
+        Host foo
+            HostName 10.0.0.1
+            LocalForward 127.0.0.1:8080 localhost:8080
+            LocalForward localhost:15432 127.0.0.1:5432
+            "#,
+        );
+
+        let opts = config.for_host("foo");
+        snapshot!(
+            opts,
+            r#"
+{
+    "hostname": "10.0.0.1",
+    "identityfile": "/home/me/.ssh/id_dsa /home/me/.ssh/id_ecdsa /home/me/.ssh/id_ed25519 /home/me/.ssh/id_rsa",
+    "localforward": "127.0.0.1:8080 localhost:8080 localhost:15432 127.0.0.1:5432",
+    "port": "22",
+    "user": "me",
     "userknownhostsfile": "/home/me/.ssh/known_hosts /home/me/.ssh/known_hosts2",
 }
 "#

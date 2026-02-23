@@ -1,6 +1,6 @@
 use crate::channelwrap::ChannelWrap;
 use crate::sftpwrap::SftpWrap;
-use filedescriptor::{AsRawSocketDescriptor, SocketDescriptor, POLLIN, POLLOUT};
+use filedescriptor::{AsRawSocketDescriptor, POLLIN, POLLOUT, SocketDescriptor};
 
 #[cfg(feature = "ssh2")]
 pub(crate) struct Ssh2Session {
@@ -88,6 +88,33 @@ impl SessionWrap {
             Self::LibSsh(sess) => {
                 let channel = sess.sess.new_channel()?;
                 channel.open_session()?;
+                Ok(ChannelWrap::LibSsh(channel))
+            }
+        }
+    }
+
+    pub fn open_direct_tcpip(
+        &self,
+        remote_host: &str,
+        remote_port: u16,
+        source_host: &str,
+        source_port: u16,
+    ) -> anyhow::Result<ChannelWrap> {
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(sess) => {
+                let channel = sess.sess.channel_direct_tcpip(
+                    remote_host,
+                    remote_port,
+                    Some((source_host, source_port)),
+                )?;
+                Ok(ChannelWrap::Ssh2(channel))
+            }
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(sess) => {
+                let channel = sess.sess.new_channel()?;
+                channel.open_forward(remote_host, remote_port, source_host, source_port)?;
                 Ok(ChannelWrap::LibSsh(channel))
             }
         }

@@ -4,9 +4,9 @@ use crate::host::*;
 use crate::pty::*;
 use crate::sessioninner::*;
 use crate::sftp::{Sftp, SftpRequest};
-use filedescriptor::{socketpair, FileDescriptor};
+use filedescriptor::{FileDescriptor, socketpair};
 use portable_pty::PtySize;
-use smol::channel::{bounded, Receiver, Sender};
+use smol::channel::{Receiver, Sender, bounded};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -123,6 +123,8 @@ impl Session {
             shown_accept_env_error: false,
             last_keep_alive: now,
             keep_alive,
+            local_forward_listeners: vec![],
+            local_forwards: vec![],
         };
         std::thread::spawn(move || inner.run());
         Ok((Self { tx: session_sender }, rx_event))

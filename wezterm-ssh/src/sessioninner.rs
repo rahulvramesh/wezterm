@@ -9,17 +9,17 @@ use crate::sftp::dir::{Dir, DirId, DirRequest};
 use crate::sftp::file::{File, FileId, FileRequest};
 use crate::sftp::{OpenWithMode, SftpChannelResult, SftpRequest};
 use crate::sftpwrap::SftpWrap;
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use camino::Utf8PathBuf;
 use filedescriptor::{
-    poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT,
+    AsRawSocketDescriptor, FileDescriptor, POLLIN, POLLOUT, poll, pollfd, socketpair,
 };
 use portable_pty::ExitStatus;
-use smol::channel::{bounded, Receiver, Sender, TryRecvError};
+use smol::channel::{Receiver, Sender, TryRecvError, bounded};
 use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -38,6 +38,13 @@ pub(crate) struct ChannelInfo {
 
 pub(crate) type ChannelId = usize;
 
+#[derive(Clone, Debug)]
+pub(crate) struct LocalForward {
+    local: SocketAddr,
+    remote_host: String,
+    remote_port: u16,
+}
+
 pub(crate) struct SessionInner {
     pub config: ConfigMap,
     pub tx_event: Sender<SessionEvent>,
@@ -52,6 +59,8 @@ pub(crate) struct SessionInner {
     pub shown_accept_env_error: bool,
     pub last_keep_alive: Instant,
     pub keep_alive: Option<Duration>,
+    pub local_forward_listeners: Vec<TcpListener>,
+    pub local_forwards: Vec<LocalForward>,
 }
 
 impl Drop for SessionInner {
@@ -253,6 +262,7 @@ impl SessionInner {
         }
         sess.set_blocking(false);
         let mut sess = SessionWrap::with_libssh(sess);
+        self.setup_local_forwarding(&mut sess)?;
         self.request_loop(&mut sess)
     }
 
@@ -317,6 +327,7 @@ impl SessionInner {
         sess.set_blocking(false);
 
         let mut sess = SessionWrap::with_ssh2(sess);
+        self.setup_local_forwarding(&mut sess)?;
         self.request_loop(&mut sess)
     }
 
@@ -413,6 +424,153 @@ impl SessionInner {
         }
     }
 
+    fn parse_local_forward_forwards(&self) -> anyhow::Result<Vec<LocalForward>> {
+        let mut forwards = vec![];
+        let Some(configured) = self.config.get("localforward") else {
+            return Ok(forwards);
+        };
+
+        let parts = configured.split_whitespace().collect::<Vec<_>>();
+        if parts.len() % 2 != 0 {
+            anyhow::bail!(
+                "invalid LocalForward entries `{configured}`; expected pairs of `<bind_address:port> <remote_host:remote_port>`"
+            );
+        }
+
+        for pair in parts.chunks_exact(2) {
+            let local = pair[0].to_socket_addrs()?.next().ok_or_else(|| {
+                anyhow!("unable to resolve LocalForward bind address `{}`", pair[0])
+            })?;
+
+            let (remote_host, remote_port) = pair[1]
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow!("invalid LocalForward destination `{}`", pair[1]))?;
+            let remote_port = remote_port.parse::<u16>().with_context(|| {
+                format!("invalid LocalForward destination port in `{}`", pair[1])
+            })?;
+
+            forwards.push(LocalForward {
+                local,
+                remote_host: remote_host.to_string(),
+                remote_port,
+            });
+        }
+
+        Ok(forwards)
+    }
+
+    fn setup_local_forwarding(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
+        self.local_forward_listeners.clear();
+        self.local_forwards = self.parse_local_forward_forwards()?;
+
+        for forward in self.local_forwards.clone() {
+            let listener = TcpListener::bind(forward.local).with_context(|| {
+                format!(
+                    "failed to bind LocalForward {} for destination {}:{}",
+                    forward.local, forward.remote_host, forward.remote_port
+                )
+            })?;
+            listener.set_nonblocking(true)?;
+
+            log::info!(
+                "LocalForward listening on {} -> {}:{}",
+                listener.local_addr()?,
+                forward.remote_host,
+                forward.remote_port
+            );
+
+            self.local_forward_listeners.push(listener.try_clone()?);
+            self.accept_local_forward_connections(sess, &listener, &forward)?;
+        }
+
+        Ok(())
+    }
+
+    fn accept_local_forward_connections(
+        &mut self,
+        sess: &mut SessionWrap,
+        listener: &TcpListener,
+        forward: &LocalForward,
+    ) -> anyhow::Result<()> {
+        loop {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    stream.set_nonblocking(true)?;
+                    self.open_local_forward_channel(sess, stream, peer, forward)?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "accepting LocalForward connection on {}",
+                            listener
+                                .local_addr()
+                                .map(|addr| addr.to_string())
+                                .unwrap_or_else(|_| "<unknown>".to_string())
+                        )
+                    });
+                }
+            }
+        }
+    }
+
+    fn open_local_forward_channel(
+        &mut self,
+        sess: &mut SessionWrap,
+        stream: TcpStream,
+        peer: SocketAddr,
+        forward: &LocalForward,
+    ) -> anyhow::Result<()> {
+        let source_host = peer.ip().to_string();
+        let channel = sess.open_direct_tcpip(
+            &forward.remote_host,
+            forward.remote_port,
+            &source_host,
+            peer.port(),
+        )?;
+
+        let mut fd = FileDescriptor::new(stream);
+        fd.set_non_blocking(true)?;
+
+        let read_from_local = fd;
+        let write_to_local = read_from_local.try_clone()?;
+
+        let channel_id = self.next_channel_id;
+        self.next_channel_id += 1;
+
+        let info = ChannelInfo {
+            channel_id,
+            channel,
+            exit: None,
+            exited: false,
+            descriptors: [
+                DescriptorState {
+                    fd: Some(read_from_local),
+                    buf: VecDeque::with_capacity(8192),
+                },
+                DescriptorState {
+                    fd: Some(write_to_local),
+                    buf: VecDeque::with_capacity(8192),
+                },
+                DescriptorState {
+                    fd: None,
+                    buf: VecDeque::with_capacity(8192),
+                },
+            ],
+        };
+
+        log::debug!(
+            "LocalForward accepted {} -> {}:{} (channel {})",
+            peer,
+            forward.remote_host,
+            forward.remote_port,
+            channel_id
+        );
+
+        self.channels.insert(channel_id, info);
+        Ok(())
+    }
+
     fn do_keepalive(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
         match sess {
             #[cfg(feature = "ssh2")]
@@ -473,6 +631,14 @@ impl SessionInner {
                     revents: 0,
                 },
             ];
+            for listener in &self.local_forward_listeners {
+                poll_array.push(pollfd {
+                    fd: listener.as_socket_descriptor(),
+                    events: POLLIN,
+                    revents: 0,
+                });
+            }
+            let listener_count = self.local_forward_listeners.len();
             let mut mapping = vec![];
 
             for info in self.channels.values() {
@@ -503,8 +669,21 @@ impl SessionInner {
                 }
                 if idx == 0 || idx == 1 {
                     // Dealt with at the top of the loop
+                } else if idx < 2 + listener_count {
+                    if poll.revents & POLLIN != 0 {
+                        let listener_index = idx - 2;
+                        if let Some(listener) = self.local_forward_listeners.get(listener_index) {
+                            let listener = listener.try_clone()?;
+                            let forward = self
+                                .local_forwards
+                                .get(listener_index)
+                                .ok_or_else(|| anyhow!("invalid local forward listener index"))?
+                                .clone();
+                            self.accept_local_forward_connections(sess, &listener, &forward)?;
+                        }
+                    }
                 } else if poll.revents != 0 {
-                    let (channel_id, fd_num) = mapping[idx - 2];
+                    let (channel_id, fd_num) = mapping[idx - 2 - listener_count];
                     let info = self.channels.get_mut(&channel_id).unwrap();
                     let state = &mut info.descriptors[fd_num];
                     let fd = state.fd.as_mut().unwrap();
@@ -524,7 +703,9 @@ impl SessionInner {
                         }
                     } else {
                         if info.exited && state.buf.is_empty() {
-                            log::trace!("channel {channel_id} exited and we have no data to send to fd {fd_num}: close it!");
+                            log::trace!(
+                                "channel {channel_id} exited and we have no data to send to fd {fd_num}: close it!"
+                            );
                             state.fd.take();
                         } else {
                             // We can write our buffered output
